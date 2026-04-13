@@ -200,23 +200,24 @@ class Emeralds(Product):
         self.fair_price = 10000
 
     def get_orders(self):
-        # Market make by over/undercutting existing orders
+        #Taking orders at fair price to balance inventory
+        if self.get_best_bid() == self.fair_price and self.position > 0:
+            self.ask(self.fair_price, min(self.position, self.buy_orders[self.fair_price]))
+        if self.get_best_ask() == self.fair_price and self.position < 0:
+            self.bid(self.fair_price, min(-self.position, -self.sell_orders[self.fair_price]))
 
-        if self.get_best_bid() == self.fair_price and self.position < 0:
-            self.bid(self.fair_price, min(-self.position, self.buy_orders()[self.fair_price]))
-        if self.get_best_ask() == self.fair_price and self.position > 0:
-            self.ask(self.fair_price, min(self.position, -self.buy_orders()[self.fair_price]))
-        if self.get_best_bid() < self.fair_price - 1:
-            self.bid(self.get_best_bid() + 1, self.max_buy_volume())
-           
-        if self.get_best_ask() > self.fair_price + 1:
-            self.ask(self.get_best_ask() - 1, self.max_sell_volume())
+        # Market make by over/undercutting existing orders
+        edge = 1
+        if self.get_best_bid() < self.fair_price - edge:
+            self.bid(self.get_best_bid() + edge, self.max_buy_volume())
+        if self.get_best_ask() > self.fair_price + edge:
+            self.ask(self.get_best_ask() - edge, self.max_sell_volume())
         
         #buy/sell at fair price if position get unbalanced
-        if self.position > 40:
-            self.ask(self.fair_price, self.position)
-        elif self.position < 40:
-            self.bid(self.fair_price, -self.position)
+        # if self.position > 40:
+        #     self.ask(self.fair_price, self.position)
+        # elif self.position < -40:
+        #     self.bid(self.fair_price, -self.position)
         
         return self.orders
 
@@ -262,6 +263,7 @@ class Trader:
         #Emeralds
         #Emeralds has a fixed true price of 10000 and thus we only market make with a spread 
         emeralds = Emeralds("EMERALDS", 80, state)
+        print(emeralds.position)
         result[emeralds.name] = emeralds.get_orders()
 
        # Tomatoes
