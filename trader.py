@@ -146,11 +146,13 @@ class Product:
         self.position_limit = limit
         self.state = state
         self.orders = []
-        self.position = self.get_position()
+        self.initial_position = self.get_initial_position()
         self.buy_orders = self.get_buy_orders()
         self.sell_orders = self.get_sell_orders()
+        self.max_buy_volume = self.get_max_buy_volume_allowed()
+        self.max_sell_volume = self.get_max_sell_volume_allowed()
 
-    def get_position(self):
+    def get_initial_position(self):
         if self.name in self.state.position:
             return self.state.position[self.name]
         else:
@@ -168,19 +170,23 @@ class Product:
     def get_best_ask(self):
         return min(self.sell_orders.keys())
 
-    def max_buy_volume(self):
-        return self.position_limit - self.position
-    
-    def max_sell_volume(self):
-        return self.position_limit + self.position
+    def get_max_buy_volume_allowed(self):
+        return self.position_limit - self.initial_position
+
+    def get_max_sell_volume_allowed(self):
+        return self.position_limit + self.initial_position
 
     def bid(self, price, volume):
-        bid_volume = min(volume, self.max_buy_volume())
-        self.orders.append(Order(self.name, price, bid_volume))
+        bid_volume = min(volume, self.max_buy_volume)
+        if bid_volume > 0:
+            self.orders.append(Order(self.name, price, bid_volume))
+            self.max_buy_volume -= bid_volume
     
     def ask(self, price, volume):
-        ask_volume = min(volume, self.max_sell_volume())
-        self.orders.append(Order(self.name, price, -ask_volume))
+        ask_volume = min(volume, self.max_sell_volume)
+        if ask_volume > 0:
+            self.orders.append(Order(self.name, price, -ask_volume))
+            self.max_sell_volume -= ask_volume
 
     def midprice(self):
         return int((self.get_best_bid() + self.get_best_ask()) // 2)
@@ -201,39 +207,41 @@ class Emeralds(Product):
 
     def get_orders(self):
         #Taking orders at fair price to balance inventory
-        if self.get_best_bid() == self.fair_price and self.position > 0:
-            self.ask(self.fair_price, min(self.position, self.buy_orders[self.fair_price]))
-        if self.get_best_ask() == self.fair_price and self.position < 0:
-            self.bid(self.fair_price, min(-self.position, -self.sell_orders[self.fair_price]))
+        if self.get_best_bid() == self.fair_price and self.initial_position > 0:
+            self.ask(self.fair_price, min(self.initial_position, self.buy_orders[self.fair_price]))
+        if self.get_best_ask() == self.fair_price and self.initial_position < 0:
+            self.bid(self.fair_price, min(-self.initial_position, -self.sell_orders[self.fair_price]))
 
         # Market make by over/undercutting existing orders
-        edge = 1
-        if self.get_best_bid() < self.fair_price - edge:
-            self.bid(self.get_best_bid() + edge, self.max_buy_volume())
-        if self.get_best_ask() > self.fair_price + edge:
-            self.ask(self.get_best_ask() - edge, self.max_sell_volume())
-        
-        #buy/sell at fair price if position get unbalanced
-        # if self.position > 40:
-        #     self.ask(self.fair_price, self.position)
-        # elif self.position < -40:
-        #     self.bid(self.fair_price, -self.position)
+        # If position gets out of balance make it more attractive to rebalance 
+        buy_edge = 1
+        sell_edge = 1
+        if self.get_best_bid() < self.fair_price - buy_edge:
+            self.bid(self.get_best_bid() + buy_edge, self.max_buy_volume)
+        if self.get_best_ask() > self.fair_price + sell_edge:
+            self.ask(self.get_best_ask() - sell_edge, self.max_sell_volume)
         
         return self.orders
 
 class Tomatoes(Product):
     def __init__(self, name, limit, state):
         super().__init__(name, limit, state)
-        self.balancing_force = 0.04
 
     def get_orders(self):
         # Market make by over/undercutting existing orders and skewing the orders based on inventory
-        balance_factor = int(-self.position * self.balancing_force)
-        if self.get_best_bid() < self.volume_weighted_midprice() - 1:
-            self.bid(self.get_best_bid() + 1 + balance_factor, self.max_buy_volume())
-           
-        if self.get_best_ask() > self.volume_weighted_midprice() + 1:
-            self.ask(self.get_best_ask() - 1 + balance_factor, self.max_sell_volume())
+        if self.get_best_bid() == self.midprice() and self.initial_position > 0:
+            self.ask(self.midprice(), min(self.initial_position, self.buy_orders[self.midprice()]))
+        if self.get_best_ask() == self.midprice() and self.initial_position < 0:
+            self.bid(self.midprice(), min(-self.initial_position, -self.sell_orders[self.midprice()]))
+
+        # Market make by over/undercutting existing orders
+        # If position gets out of balance make it more attractive to rebalance 
+        buy_edge = 1
+        sell_edge = 1
+        if self.get_best_bid() < self.midprice() - buy_edge:
+            self.bid(self.get_best_bid() + buy_edge, self.max_buy_volume)
+        if self.get_best_ask() > self.midprice() + sell_edge:
+            self.ask(self.get_best_ask() - sell_edge, self.max_sell_volume)
 
         
         return self.orders
@@ -263,7 +271,6 @@ class Trader:
         #Emeralds
         #Emeralds has a fixed true price of 10000 and thus we only market make with a spread 
         emeralds = Emeralds("EMERALDS", 80, state)
-        print(emeralds.position)
         result[emeralds.name] = emeralds.get_orders()
 
        # Tomatoes
