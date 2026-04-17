@@ -406,56 +406,25 @@ class ASH_COATED_OSMIUM(Product):
             if bp >= fair + 1:
                 self.ask(int(bp), self.buy_orders[bp])
 
-        # ── Lag-1 reversal signal (ASH has -0.50 lag-1 autocorrelation) ─────────
-        prev_fair = self.trader_data_store.get_product_value(self.name, "prev_fair")
-        if prev_fair is not None:
-            delta = fair - prev_fair
-            if delta > 0:
-                self.ask(self.get_best_ask(), self.max_sell_volume)
-            elif delta < 0:
-                self.bid(self.get_best_bid(), self.max_buy_volume)
-        self.trader_data_store.set_product_value(self.name, "prev_fair", fair)
-
-        # ── Z-score mean reversion ─────────────────────────────────────────────
-        z_thr = 0.0
+        # ── Z-score mean reversion (conservative threshold) ────────────────────
+        z_thr = {0: 2.0, 1: 1.5, 2: 1.0}.get(n_pairs, 1.5)
         z = self.Z_score(fair)
         if z > z_thr:
             self.ask(self.get_best_ask(), self.max_sell_volume)
         if z < -z_thr:
             self.bid(self.get_best_bid(), self.max_buy_volume)
 
-        # ── Order-book imbalance signal ───────────────────────────────────────
-        total_bid = sum(self.buy_orders.values())
-        total_ask = sum(abs(v) for v in self.sell_orders.values())
-        total_vol = total_bid + total_ask
-        imbalance = (total_bid - total_ask) / total_vol if total_vol > 0 else 0.0
-        IMB_THR = 0.0
-        if imbalance > IMB_THR:
-            self.ask(self.get_best_ask(), self.max_sell_volume)
-        if imbalance < -IMB_THR:
-            self.bid(self.get_best_bid(), self.max_buy_volume)
+        # ── Lag-1 reversal signal (threshold filters noise)
+        prev_fair = self.trader_data_store.get_product_value(self.name, "prev_fair")
+        if prev_fair is not None:
+            delta = fair - prev_fair
+            if delta > 1.0:
+                self.ask(self.get_best_ask(), self.max_sell_volume)
+            elif delta < -1.0:
+                self.bid(self.get_best_bid(), self.max_buy_volume)
+        self.trader_data_store.set_product_value(self.name, "prev_fair", fair)
 
-        # ── Inside-spread order detection (informed trader signal) ────────────
-        # If a non-MM order is placed inside the MM spread, it's a strong directional signal
-        inside_bid_signal = False
-        inside_ask_signal = False
-        if n_pairs > 0:
-            inner_bid, inner_ask = pairs[0][0], pairs[0][1]
-            for bp in self.buy_orders:
-                if bp > inner_bid:  # bid inside MM spread
-                    inside_bid_signal = True
-                    break
-            for ap in self.sell_orders:
-                if ap < inner_ask:  # ask inside MM spread
-                    inside_ask_signal = True
-                    break
-        if inside_bid_signal:
-            self.bid(self.get_best_bid(), self.max_buy_volume)
-        if inside_ask_signal:
-            self.ask(self.get_best_ask(), self.max_sell_volume)
-
-        # ── Passive making anchored to MM fair ───────────────────────────────
-        # Overbid the best existing bid below fair; undercut best ask above fair.
+        # ── FH passive making anchored to MM fair ─────────────────────────────
         best_bid_below = max((p for p in self.buy_orders if p < ref), default=None)
         best_ask_above = min((p for p in self.sell_orders if p > ref), default=None)
         if best_bid_below is not None:
