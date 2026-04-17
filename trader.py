@@ -406,24 +406,6 @@ class ASH_COATED_OSMIUM(Product):
             if bp >= fair + 1:
                 self.ask(int(bp), self.buy_orders[bp])
 
-        # ── Z-score mean reversion (conservative threshold) ────────────────────
-        z_thr = {0: 2.0, 1: 1.5, 2: 1.0}.get(n_pairs, 1.5)
-        z = self.Z_score(fair)
-        if z > z_thr:
-            self.ask(self.get_best_ask(), self.max_sell_volume)
-        if z < -z_thr:
-            self.bid(self.get_best_bid(), self.max_buy_volume)
-
-        # ── Lag-1 reversal signal (threshold filters noise)
-        prev_fair = self.trader_data_store.get_product_value(self.name, "prev_fair")
-        if prev_fair is not None:
-            delta = fair - prev_fair
-            if delta > 1.0:
-                self.ask(self.get_best_ask(), self.max_sell_volume)
-            elif delta < -1.0:
-                self.bid(self.get_best_bid(), self.max_buy_volume)
-        self.trader_data_store.set_product_value(self.name, "prev_fair", fair)
-
         # ── FH passive making anchored to MM fair ─────────────────────────────
         best_bid_below = max((p for p in self.buy_orders if p < ref), default=None)
         best_ask_above = min((p for p in self.sell_orders if p > ref), default=None)
