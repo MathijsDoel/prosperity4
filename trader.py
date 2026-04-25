@@ -1,13 +1,9 @@
-from typing import Any
+from typing import Any, Dict, List
 import json
 
 from datamodel import Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState, Listing, Observation
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# With GAMMA=g and spread half-width=s, effective max inventory ≈ s/g.
-# HP spread=16 (half=8), GAMMA=0.25 → max pos ≈ 32 units → low variance.
-# VEV spread=5  (half=2.5), GAMMA=0.15 → max pos ≈ 17 units.
-
 HP_GAMMA  = 0.15
 HP_LIMIT  = 200
 
@@ -18,11 +14,11 @@ VEV_LIMIT = 200
 # ── Logger ────────────────────────────────────────────────────────────────────
 
 class Logger:
-    def __init__(self) -> None:
+    def __init__(self):
         self.logs = ""
         self.max_log_length = 3750
 
-    def flush(self, state: TradingState, orders: dict, conversions: int, trader_data: str) -> None:
+    def flush(self, state, orders, conversions, trader_data):
         base = len(self.to_json([
             self.compress_state(state, ""), self.compress_orders(orders),
             conversions, "", "",
@@ -41,13 +37,17 @@ class Logger:
             state.timestamp, td,
             [[l.symbol, l.product, l.denomination] for l in state.listings.values()],
             {s: [od.buy_orders, od.sell_orders] for s, od in state.order_depths.items()},
-            self._trades(state.own_trades), self._trades(state.market_trades),
-            state.position, self.compress_observations(state.observations),
+            self._trades(state.own_trades),
+            self._trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
         ]
 
     def _trades(self, trades):
-        return [[t.symbol, t.price, t.quantity, t.buyer, t.seller, t.timestamp]
-                for arr in trades.values() for t in arr]
+        return [
+            [t.symbol, t.price, t.quantity, t.buyer, t.seller, t.timestamp]
+            for arr in trades.values() for t in arr
+        ]
 
     def compress_observations(self, obs):
         co = {}
@@ -57,18 +57,22 @@ class Logger:
         return [obs.plainValueObservations, co]
 
     def compress_orders(self, orders):
-        return [[o.symbol, o.price, o.quantity] for arr in orders.values() for o in arr]
+        return [
+            [o.symbol, o.price, o.quantity]
+            for arr in orders.values() for o in arr
+        ]
 
-    def to_json(self, v: Any) -> str:
+    def to_json(self, v):
         return json.dumps(v, cls=ProsperityEncoder, separators=(",", ":"))
 
-    def truncate(self, value: str, max_length: int) -> str:
+    def truncate(self, value, max_length):
         lo, hi, out = 0, min(len(value), max_length), ""
         while lo <= hi:
             mid = (lo + hi) // 2
             c = value[:mid] + ("..." if mid < len(value) else "")
             if len(json.dumps(c)) <= max_length:
-                out = c; lo = mid + 1
+                out = c
+                lo = mid + 1
             else:
                 hi = mid - 1
         return out
@@ -77,31 +81,22 @@ class Logger:
 logger = Logger()
 
 
-# ── Market-making helper ──────────────────────────────────────────────────────
+# ── Market-making ─────────────────────────────────────────────────────────────
 
-def mm_orders(name: str, od: OrderDepth, pos: int, limit: int, gamma: float) -> list[Order]:
+def mm_orders(name, od, pos, limit, gamma):
     """
-    Pure passive market maker. No take phase — that was causing us to buy
-    200 units into every HP downtrend.
-
-    Posts:
-      bid  at  best_bid_below_reservation  + 1   (overbid inside spread)
-      ask  at  best_ask_above_reservation  - 1   (undercut inside spread)
-
-    where reservation = mid - gamma * pos.
-
-    As pos grows positive  → reservation falls → bid moves down, ask moves down
-      → market naturally sells to us less and we sell more → inventory reverts.
-    As pos grows negative  → reservation rises → same logic in reverse.
-
-    With gamma=0.25 and HP spread half-width≈8: effective max pos ≈ 8/0.25 = 32.
+    Passive market maker anchored to current market mid.
+    reservation = mid - gamma * pos
+    Post bid at best_bid_below_reservation + 1
+    Post ask at best_ask_above_reservation - 1
+    No take phase: prevents buying 200 units into downtrends.
     """
     if not od.buy_orders or not od.sell_orders:
         return []
 
     bb  = max(od.buy_orders)
     ba  = min(od.sell_orders)
-    mid = (bb + ba) / 2
+    mid = (bb + ba) / 2.0
     mx_b = limit - pos
     mx_s = limit + pos
 
@@ -110,7 +105,7 @@ def mm_orders(name: str, od: OrderDepth, pos: int, limit: int, gamma: float) -> 
     bb_below = max((p for p in od.buy_orders  if p < reservation), default=None)
     ba_above = min((p for p in od.sell_orders if p > reservation), default=None)
 
-    orders: list[Order] = []
+    orders = []
     if bb_below is not None and mx_b > 0:
         orders.append(Order(name, bb_below + 1, mx_b))
     if ba_above is not None and mx_s > 0:
@@ -122,8 +117,8 @@ def mm_orders(name: str, od: OrderDepth, pos: int, limit: int, gamma: float) -> 
 
 class Trader:
 
-    def run(self, state: TradingState):
-        result: dict[Symbol, list[Order]] = {}
+    def run(self, state):
+        result = {}
 
         if "HYDROGEL_PACK" in state.order_depths:
             result["HYDROGEL_PACK"] = mm_orders(
