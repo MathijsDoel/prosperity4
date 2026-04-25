@@ -4,12 +4,14 @@ import json
 from datamodel import Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState, Listing, Observation
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# With GAMMA=g and spread half-width=s, effective max inventory ≈ s/g.
+# HP spread=16 (half=8), GAMMA=0.25 → max pos ≈ 32 units → low variance.
+# VEV spread=5  (half=2.5), GAMMA=0.15 → max pos ≈ 17 units.
 
-HP_FAIR  = 10000.0   # used ONLY for obvious-misprice taking (wide edge)
-HP_GAMMA = 0.10      # inventory skew: reservation = mid - GAMMA * position
-HP_LIMIT = 200
+HP_GAMMA  = 0.15
+HP_LIMIT  = 200
 
-VEV_GAMMA = 0.05
+VEV_GAMMA = 0.15
 VEV_LIMIT = 200
 
 
@@ -39,10 +41,8 @@ class Logger:
             state.timestamp, td,
             [[l.symbol, l.product, l.denomination] for l in state.listings.values()],
             {s: [od.buy_orders, od.sell_orders] for s, od in state.order_depths.items()},
-            self._trades(state.own_trades),
-            self._trades(state.market_trades),
-            state.position,
-            self.compress_observations(state.observations),
+            self._trades(state.own_trades), self._trades(state.market_trades),
+            state.position, self.compress_observations(state.observations),
         ]
 
     def _trades(self, trades):
@@ -77,23 +77,24 @@ class Logger:
 logger = Logger()
 
 
-def mm_orders(name: str, od: OrderDepth, pos: int, limit: int,
-              gamma: float, fair: float | None = None) -> list[Order]:
+# ── Market-making helper ──────────────────────────────────────────────────────
+
+def mm_orders(name: str, od: OrderDepth, pos: int, limit: int, gamma: float) -> list[Order]:
     """
-    Pure market-maker: always posts a bid and an ask inside the current spread,
-    skewed by inventory.
+    Pure passive market maker. No take phase — that was causing us to buy
+    200 units into every HP downtrend.
 
-    reservation = mid - gamma * pos
-      - positive pos → reservation < mid → we quote lower (prefer selling)
-      - negative pos → reservation > mid → we quote higher (prefer buying)
+    Posts:
+      bid  at  best_bid_below_reservation  + 1   (overbid inside spread)
+      ask  at  best_ask_above_reservation  - 1   (undercut inside spread)
 
-    We then overbid the best existing bid below reservation, and undercut
-    the best existing ask above reservation.  This guarantees both sides
-    are always live regardless of where the price is trading.
+    where reservation = mid - gamma * pos.
 
-    Optional `fair`: if set, also take orders that are clearly mispriced
-    (ask far below fair or bid far above fair) with a wide edge to avoid
-    chasing trends.
+    As pos grows positive  → reservation falls → bid moves down, ask moves down
+      → market naturally sells to us less and we sell more → inventory reverts.
+    As pos grows negative  → reservation rises → same logic in reverse.
+
+    With gamma=0.25 and HP spread half-width≈8: effective max pos ≈ 8/0.25 = 32.
     """
     if not od.buy_orders or not od.sell_orders:
         return []
@@ -101,36 +102,23 @@ def mm_orders(name: str, od: OrderDepth, pos: int, limit: int,
     bb  = max(od.buy_orders)
     ba  = min(od.sell_orders)
     mid = (bb + ba) / 2
-
     mx_b = limit - pos
     mx_s = limit + pos
-    orders: list[Order] = []
 
-    # Optional take: only for very obvious mispricings (e.g. HP_FAIR ± 15)
-    if fair is not None:
-        TAKE_EDGE = 15
-        for ap in sorted(od.sell_orders):
-            if ap <= fair - TAKE_EDGE and mx_b > 0:
-                v = min(abs(od.sell_orders[ap]), mx_b)
-                orders.append(Order(name, ap, v)); mx_b -= v
-        for bp in sorted(od.buy_orders, reverse=True):
-            if bp >= fair + TAKE_EDGE and mx_s > 0:
-                v = min(od.buy_orders[bp], mx_s)
-                orders.append(Order(name, bp, -v)); mx_s -= v
-
-    # Passive quotes anchored to MARKET MID (not a fixed fair value)
     reservation = mid - gamma * pos
 
     bb_below = max((p for p in od.buy_orders  if p < reservation), default=None)
     ba_above = min((p for p in od.sell_orders if p > reservation), default=None)
 
+    orders: list[Order] = []
     if bb_below is not None and mx_b > 0:
         orders.append(Order(name, bb_below + 1, mx_b))
     if ba_above is not None and mx_s > 0:
         orders.append(Order(name, ba_above - 1, -mx_s))
-
     return orders
 
+
+# ── Trader ────────────────────────────────────────────────────────────────────
 
 class Trader:
 
@@ -143,7 +131,6 @@ class Trader:
                 state.order_depths["HYDROGEL_PACK"],
                 state.position.get("HYDROGEL_PACK", 0),
                 HP_LIMIT, HP_GAMMA,
-                fair=HP_FAIR,   # take orders only at HP_FAIR ± 15
             )
 
         if "VELVETFRUIT_EXTRACT" in state.order_depths:
@@ -152,7 +139,6 @@ class Trader:
                 state.order_depths["VELVETFRUIT_EXTRACT"],
                 state.position.get("VELVETFRUIT_EXTRACT", 0),
                 VEV_LIMIT, VEV_GAMMA,
-                fair=None,  # no fixed fair for VEV; pure spread-capture
             )
 
         logger.flush(state, result, 0, "")
