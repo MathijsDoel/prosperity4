@@ -1,0 +1,64 @@
+ROUND 3 FINDINGS — "Gloves Off"
+================================
+
+PRODUCTS
+--------
+- HYDROGEL_PACK       (limit 200) — stable, mean-reverting around ~10000, spread ~16
+- VELVETFRUIT_EXTRACT (limit 200) — slightly drifty, spread ~6
+- VEV_XXXX options    (limit 300 each) — European calls on VEV, 10 strikes 4000–6500, TTE decreasing from 5→2 over backtester days
+
+MANUAL TRADING (Bio-Pods / Celestial Gardeners)
+------------------------------------------------
+- Reserve prices uniform on {670, 675, ..., 920} (51 levels)
+- Sell all at 920 next day
+- Optimal bids: b1 = 751, b2 = 841
+  - 751 = just above the 750 reserve level (captures r=750 counterparty for 1 extra)
+  - 841 = just above r=840, AND safely above Nash equilibrium avg_b2 ≈ 836.7
+  - Rule: bid at 5k+1, not 5k — captures one extra counterparty for negligible cost
+- b2 game theory: penalty = ((920 - avg_b2) / (920 - b2))^3 if b2 < avg_b2
+  - Nash equilibrium avg_b2 ≈ 837; bidding at/above this avoids penalty entirely
+
+VEV OPTIONS — KEY OBSERVATIONS
+--------------------------------
+- Implied vol ≈ 0.016/game-day; realized vol ≈ 0.0215/game-day (options slightly cheap)
+- Deep ITM (4000, 4500): priced at intrinsic (S–K), no time value, implied vol ≈ 0
+- ATM zone (5000–5400): flat implied vol smile at ~0.016, most liquid
+- Far OTM (5500, 6000, 6500): nearly worthless (0–9 each), avoid
+- VEV price on competition day went DOWN -3.5 — directional long lost money
+
+WHAT WORKED / WHAT DIDN'T
+--------------------------
+WORKED:
+  - HYDROGEL_PACK Frankfurt MM: ~28–60k/day depending on intraday volatility
+  - Symmetric MM (bid+ask always live) using market mid as reference
+
+DIDN'T WORK:
+  - Max-long VEV + deep ITM options: made money in backtest (VEV trended up hist.)
+    but lost on actual competition day (VEV went down -4)
+  - HP_GAMMA=0 with fixed FAIR=10000 as quote reference: when HP drifted to 9960,
+    ba_above returned None → only posted bids, never asks → bought the whole fall
+    → -5.4k loss on HP alone in first submission
+
+CRITICAL BUG (first two submissions)
+--------------------------------------
+Using HP_FAIR=10000 as the passive-quote reservation:
+    reservation = HP_FAIR - GAMMA * pos
+    ba_above = min(p for p in sell_orders if p > reservation)  # = None when HP at 9960!
+
+When HP trades far from FAIR, ba_above = None → no ask posted → one-sided buyer.
+FIX: anchor reservation to MARKET MID, not a fixed fair value.
+
+FINAL STRATEGY (submitted, commit 28c5c7a)
+-------------------------------------------
+- HP:  symmetric MM, reservation = mid - 0.10 * pos
+       take edge = ±15 (only very obvious mispricings)
+- VEV: symmetric MM, reservation = mid - 0.05 * pos, no fixed fair
+- Options: not traded (too risky without clear edge)
+- Backtest result: 132k total over 3 days, Sharpe 2.2, max drawdown 4.8%
+
+PARAMETERS
+----------
+HP_GAMMA  = 0.10  (inventory skew; prevents runaway accumulation on trending days)
+VEV_GAMMA = 0.05
+Both use overbid/undercut pattern: bid at best_bid_below_reservation + 1,
+                                   ask at best_ask_above_reservation - 1
