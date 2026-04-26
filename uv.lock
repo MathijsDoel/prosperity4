@@ -1535,7 +1535,6 @@ dependencies = [
     { name = "plotly" },
     { name = "scipy" },
     { name = "statsmodels" },
-    { name = "scipy" },
 ]
 
 [package.metadata]
@@ -1545,6 +1544,8 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "plotly", specifier = ">=6.7.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
+    { name = "statsmodels", specifier = ">=0.14.6" },
 ]
 
 [[package]]
