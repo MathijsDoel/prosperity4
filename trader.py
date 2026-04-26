@@ -2,7 +2,33 @@
 from typing import List, Any
 import string
 import json
-import numpy as np
+import math
+
+from datamodel import Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState, Listing, Observation
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+# HYDROGEL_PACK — stable mean-reverter around 10000, spread ~16
+HP_LIMIT      = 200
+HP_GAMMA      = 0.10     # inventory skew: reservation shifts 0.1 per unit held
+HP_TAKE_EDGE  = 15       # take mispriced orders when >15 from FV
+# VELVETFRUIT_EXTRACT — drifty (+14/day hist.), spread ~6
+# No take phase: EMA lags on trending days, causing wrong-way aggressive fills.
+# Passive MM only using current mid as reference.
+VEV_LIMIT     = 200
+VEV_GAMMA     = 0.05
+
+# VEV options — BS MM on liquid ATM strikes (5400+ has 2-tick spread → skip; 4000/4500 pure intrinsic)
+ATM_STRIKES   = [5000, 5100, 5200, 5300]
+OPT_LIMIT     = 50       # conservative per-strike position cap
+OPT_SIGMA     = 0.016    # market implied vol for neutral BS pricing
+OPT_HALF_SPD  = 1        # ±1 from BS FV → 2-tick spread; guarantees no zero-spread quoting
+OPT_GAMMA     = 0.02     # small skew: moves quotes ~1 tick per 50 units inventory
+OPT_TAKE_EDGE = 6        # take if ask < BS_FV - 6 or bid > BS_FV + 6
+
+# TTE tracking
+TTE_START     = 5.0
+TICKS_PER_DAY = 1_000_000   # timestamps 0–999900, ~1M per day
 
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
@@ -146,142 +172,150 @@ class TraderDataStore:
         self.data = self._parse(raw_trader_data)
         self.data.setdefault("products", {})
 
-    def _parse(self, raw_trader_data: str) -> dict:
-        if not raw_trader_data:
-            return {}
-        try:
-            parsed = json.loads(raw_trader_data)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        return {}
+# ── Black-Scholes helpers ─────────────────────────────────────────────────────
 
-    def _product_bucket(self, product_name: str) -> dict:
-        products = self.data.setdefault("products", {})
-        bucket = products.setdefault(product_name, {})
-        return bucket
+def _ncdf(x):
+    if x < 0:
+        return 1.0 - _ncdf(-x)
+    k = 1.0 / (1.0 + 0.2316419 * x)
+    p = k * (0.319381530 + k * (-0.356563782 + k * (1.781477937 + k * (-1.821255978 + k * 1.330274429))))
+    return 1.0 - math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi) * p
 
-    def get_product_value(self, product_name: str, key: str, default=None):
-        return self._product_bucket(product_name).get(key, default)
-
-    def set_product_value(self, product_name: str, key: str, value: Any) -> None:
-        self._product_bucket(product_name)[key] = value
-
-    def add_midprice(self, product_name: str, midprice: int | None) -> list[int]:
-        bucket = self._product_bucket(product_name)
-        history = bucket.get("midprices", [])
-        if not isinstance(history, list):
-            history = []
-        if midprice is not None:
-            history.append(midprice)
-        bucket["midprices"] = history[-self.max_midprice_history:]
-        return bucket["midprices"]
-
-    def to_json(self) -> str:
-        try:
-            return json.dumps(self.data, separators=(",", ":"))
-        except Exception:
-            return ""
-
-class Product:
-    def __init__(self, name, limit, state, trader_data_store: TraderDataStore):
-        self.name = name
-        self.position_limit = limit
-        self.state = state
-        self.orders = []
-        self.initial_position = self.get_initial_position()
-        self.buy_orders = self.get_buy_orders()
-        self.sell_orders = self.get_sell_orders()
-        self.max_buy_volume = self.get_max_buy_volume_allowed()
-        self.max_sell_volume = self.get_max_sell_volume_allowed()
-        self.trader_data_store = trader_data_store
+def bs_call(S, K, T, sigma):
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    st = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / st
+    return S * _ncdf(d1) - K * _ncdf(d1 - st)
 
 
-    def get_initial_position(self):
-        if self.name in self.state.position:
-            return self.state.position[self.name]
-        else:
-            return 0
+# ── Non-derivative MM (HP and VEV) ────────────────────────────────────────────
 
-    def get_buy_orders(self):
-        return self.state.order_depths[self.name].buy_orders
-
-    def get_sell_orders(self):
-        return self.state.order_depths[self.name].sell_orders
-
-    def get_best_bid(self):
-        if len(self.buy_orders) > 0:
-            return max(self.buy_orders.keys())
-        else:
-            return None
-
-    def get_best_ask(self):
-        if len(self.sell_orders) > 0:
-            return min(self.sell_orders.keys())
-        else: 
-            return None
-
-    def get_max_buy_volume_allowed(self):
-        return self.position_limit - self.initial_position
-
-    def get_max_sell_volume_allowed(self):
-        return self.position_limit + self.initial_position
-
-    def bid(self, price, volume):
-        bid_volume = min(volume, self.max_buy_volume)
-        if bid_volume > 0:
-            self.orders.append(Order(self.name, price, bid_volume))
-            self.max_buy_volume -= bid_volume
-
-    def ask(self, price, volume):
-        ask_volume = min(volume, self.max_sell_volume)
-        if ask_volume > 0:
-            self.orders.append(Order(self.name, price, -ask_volume))
-            self.max_sell_volume -= ask_volume
-
-    def midprice(self):
-        if self.get_best_bid() is not None and self.get_best_ask() is not None:
-            return int((self.get_best_bid() + self.get_best_ask()) // 2)
-        else:
-            return None
-
-    def volume_weighted_midprice(self):
-        if len(self.buy_orders) > 0 and len(self.sell_orders) > 0:
-            buy_volume = np.array(list(self.buy_orders.values()))
-            buy_prices = np.array(list(self.buy_orders.keys()))
-
-            sell_volume = np.array(list(self.sell_orders.values()))
-            sell_prices = np.array(list(self.sell_orders.keys()))
-
-            return int((np.sum(buy_volume * buy_prices) + np.sum(-sell_volume * sell_prices)) / (np.sum(buy_volume) + -np.sum(sell_volume)))
-        else:
-            return None
-
-class INTARIAN_PEPPER_ROOT(Product):
+def mm_orders_hp(od, pos):
     """
-    Intarian_pepper_root has a linearly climbing fair price which we will market make around making sure that we keep a long position
-    We will do this by taking at fair price to take a long position
+    HYDROGEL_PACK MM:
+      FV = current market mid. HP is stable so mid ≈ 10000 long-run.
+      Phase 1: aggressive take when >HP_TAKE_EDGE from FV.
+      Phase 2: passive overbid/undercut around inventory-skewed reservation.
     """
     def __init__(self, name, limit, state, trader_data_store):
         super().__init__(name, limit, state, trader_data_store)
 
-    def get_orders(self):
-        if self.get_best_bid() is None or self.get_best_ask() is None:
-            return []
+    bb  = max(od.buy_orders)
+    ba  = min(od.sell_orders)
+    mid = (bb + ba) / 2.0
 
-        fair = (self.get_best_bid() + self.get_best_ask()) / 2
+    fv   = mid
+    mx_b = HP_LIMIT - pos
+    mx_s = HP_LIMIT + pos
+    orders = []
 
-        # ── Trend detection ───────────────────────────────────────────────────
-        # Track midprice history to detect if the trend reverses.
-        # Slope is computed as (avg of recent half - avg of older half) / half_window.
-        # In a normal up-trend this is ~+0.1/tick; a clear reversal gives < NEG_THRESHOLD.
-        history = self.trader_data_store.add_midprice(self.name, fair)
+    # Phase 1: aggressive take
+    for ap in sorted(od.sell_orders):
+        if ap > fv - HP_TAKE_EDGE:
+            break
+        vol = min(abs(od.sell_orders[ap]), mx_b)
+        if vol > 0:
+            orders.append(Order("HYDROGEL_PACK", ap, vol))
+            mx_b -= vol; pos += vol
 
-        TREND_WINDOW   = 60    # ticks of history to measure slope over
-        NEG_THRESHOLD  = -0.02 # slope/tick that triggers exit (price clearly falling)
-        POS_THRESHOLD  =  0.05 # slope/tick required to re-enter after being flat
-        WAIT_TICKS     = 100   # ticks to sit flat before re-evaluating direction
+    for bp in sorted(od.buy_orders, reverse=True):
+        if bp < fv + HP_TAKE_EDGE:
+            break
+        vol = min(od.buy_orders[bp], mx_s)
+        if vol > 0:
+            orders.append(Order("HYDROGEL_PACK", bp, -vol))
+            mx_s -= vol; pos -= vol
+
+    # Phase 2: passive overbid/undercut
+    reservation = fv - HP_GAMMA * pos
+    bb_below = max((p for p in od.buy_orders  if p < reservation), default=None)
+    ba_above = min((p for p in od.sell_orders if p > reservation), default=None)
+
+    if bb_below is not None and mx_b > 0:
+        orders.append(Order("HYDROGEL_PACK", bb_below + 1, mx_b))
+    if ba_above is not None and mx_s > 0:
+        orders.append(Order("HYDROGEL_PACK", ba_above - 1, -mx_s))
+
+    return orders
+
+
+def mm_orders_vev(od, pos, fv):
+    """
+    VELVETFRUIT_EXTRACT MM — passive only, no take phase.
+    FV = current market mid (passed in). No lagging EMA to avoid wrong-way
+    aggressive fills on trending days. Inventory skew via AS reservation.
+    """
+    if not od.buy_orders or not od.sell_orders:
+        return []
+
+    mx_b = VEV_LIMIT - pos
+    mx_s = VEV_LIMIT + pos
+    orders = []
+
+    reservation = fv - VEV_GAMMA * pos
+    bb_below = max((p for p in od.buy_orders  if p < reservation), default=None)
+    ba_above = min((p for p in od.sell_orders if p > reservation), default=None)
+
+    if bb_below is not None and mx_b > 0:
+        orders.append(Order("VELVETFRUIT_EXTRACT", bb_below + 1, mx_b))
+    if ba_above is not None and mx_s > 0:
+        orders.append(Order("VELVETFRUIT_EXTRACT", ba_above - 1, -mx_s))
+
+    return orders
+
+
+# ── Option MM ────────────────────────────────────────────────────────────────
+
+def option_mm_orders(name, od, pos, vev_mid, K, tte):
+    """
+    BS-based option MM using VEV mid-price as spot (correlation-based FV):
+      - FV = BS(vev_mid, K, tte, OPT_SIGMA)
+      - Reservation = FV - OPT_GAMMA * pos  (inventory skew keeps position balanced)
+      - Phase 1: take if ask < FV - OPT_TAKE_EDGE or bid > FV + OPT_TAKE_EDGE
+      - Phase 2: post bid at int(reservation) - OPT_HALF_SPD,
+                       ask at int(reservation) + OPT_HALF_SPD
+    """
+    if not od.buy_orders or not od.sell_orders or vev_mid is None or tte <= 0:
+        return []
+
+    fv = bs_call(vev_mid, K, tte, OPT_SIGMA)
+    if fv <= 0:
+        return []
+
+    bb = max(od.buy_orders)
+    ba = min(od.sell_orders)
+
+    mx_b = OPT_LIMIT - pos
+    mx_s = OPT_LIMIT + pos
+    orders = []
+
+    # Phase 1: take obvious mispricings
+    if ba <= fv - OPT_TAKE_EDGE and mx_b > 0:
+        vol = min(abs(od.sell_orders[ba]), mx_b)
+        orders.append(Order(name, ba, vol))
+        mx_b -= vol
+        pos  += vol
+
+    if bb >= fv + OPT_TAKE_EDGE and mx_s > 0:
+        vol = min(od.buy_orders[bb], mx_s)
+        orders.append(Order(name, bb, -vol))
+        mx_s -= vol
+        pos  -= vol
+
+    # Phase 2: fixed ±OPT_HALF_SPD around inventory-skewed reservation.
+    # Small gamma keeps quotes near market even at large positions.
+    # Guaranteed 2-tick spread prevents zero-spread adverse selection.
+    reservation = fv - OPT_GAMMA * pos
+    bid_p = int(reservation) - OPT_HALF_SPD
+    ask_p = int(reservation) + OPT_HALF_SPD
+
+    if bid_p < ba and mx_b > 0:
+        orders.append(Order(name, bid_p, mx_b))
+    if ask_p > bb and mx_s > 0:
+        orders.append(Order(name, ask_p, -mx_s))
+
+    return orders
 
         slope = None
         if len(history) >= TREND_WINDOW:
@@ -453,19 +487,54 @@ class Trader:
         result = {}
         trader_data_store = TraderDataStore(state.traderData)
 
-        #Intaran_pepper_root
-        #Intaran_pepper_root has a linear true price
-        if "INTARIAN_PEPPER_ROOT" in state.order_depths:
-            intaran_pepper_root = INTARIAN_PEPPER_ROOT("INTARIAN_PEPPER_ROOT", 80, state, trader_data_store)
-            result[intaran_pepper_root.name] = intaran_pepper_root.get_orders()
+        # Load persisted state
+        try:
+            store = json.loads(state.traderData) if state.traderData else {}
+            if not isinstance(store, dict):
+                store = {}
+        except Exception:
+            store = {}
 
-        # Ash_coated_osmium
-        # Ash_coated_osmium price fluctuates so we need an accurate predictor of true price
-        if "ASH_COATED_OSMIUM" in state.order_depths:
-            ash_coated_osmium = ASH_COATED_OSMIUM("ASH_COATED_OSMIUM", 80, state, trader_data_store)
-            result[ash_coated_osmium.name] = ash_coated_osmium.get_orders()
+        # TTE tracking: detect day boundary when timestamp resets
+        last_ts  = store.get("last_ts", 0)
+        tte_base = store.get("tte_base", TTE_START)
+        if state.timestamp < last_ts:             # day rolled over
+            tte_base = max(0.0, tte_base - 1.0)
+        tte = tte_base - state.timestamp / TICKS_PER_DAY
+        store["last_ts"]  = state.timestamp
+        store["tte_base"] = tte_base
 
-        traderData = trader_data_store.to_json()
-        conversions = 0
-        logger.flush(state, result, conversions, traderData)
-        return result, conversions, traderData
+        # ── HYDROGEL_PACK ─────────────────────────────────────────────────────
+        # HP is stable mean-reverting: use slow EMA as FV + aggressive take phase.
+        if "HYDROGEL_PACK" in state.order_depths:
+            od  = state.order_depths["HYDROGEL_PACK"]
+            pos = state.position.get("HYDROGEL_PACK", 0)
+            result["HYDROGEL_PACK"] = mm_orders_hp(od, pos)
+
+        # ── VELVETFRUIT_EXTRACT ───────────────────────────────────────────────
+        # VEV drifts: use current market mid as FV (no lagging EMA), passive MM only.
+        vev_mid = None
+        if "VELVETFRUIT_EXTRACT" in state.order_depths:
+            od = state.order_depths["VELVETFRUIT_EXTRACT"]
+            if od.buy_orders and od.sell_orders:
+                vev_mid = (max(od.buy_orders) + min(od.sell_orders)) / 2.0
+            result["VELVETFRUIT_EXTRACT"] = mm_orders_vev(
+                od,
+                state.position.get("VELVETFRUIT_EXTRACT", 0),
+                vev_mid,
+            )
+
+        # ── VEV Options: BS MM using current VEV price as spot ────────────────
+        # VEV mid-price feeds directly into Black-Scholes to price each option.
+        # This cross-asset correlation is the FV predictor for all derivatives.
+        if vev_mid is not None and tte > 0.01:
+            for K in ATM_STRIKES:
+                name = f"VEV_{K}"
+                if name not in state.order_depths:
+                    continue
+                od  = state.order_depths[name]
+                pos = state.position.get(name, 0)
+                result[name] = option_mm_orders(name, od, pos, vev_mid, K, tte)
+
+        logger.flush(state, result, 0, json.dumps(store, separators=(",", ":")))
+        return result, 0, json.dumps(store, separators=(",", ":"))
